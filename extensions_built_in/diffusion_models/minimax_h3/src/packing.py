@@ -359,6 +359,8 @@ def build_packed_sequence(
                 + _temporal_position_span(num_latent_frames)
                 - _ROPE_FRAME_RESCALE
             )
+        elif isinstance(anchor, (int, float)) and not isinstance(anchor, bool):   # HERESY 1879: a context frame at its own time (before frame 0)
+            anchor_time = float(num_text) + float(anchor)
         else:
             raise ValueError(
                 f"keyframe anchor must be 'first' or 'last', got {anchor!r}"

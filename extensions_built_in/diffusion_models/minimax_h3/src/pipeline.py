@@ -80,6 +80,11 @@ class MiniMaxH3Pipeline:
             list
         ] = None,  # ref2va references, already area-matched (own aspect, /32)
         with_audio: bool = True,
+        context_latents: Optional[torch.Tensor] = None,  # HERESY 1879: (1, 24, K, h, w), the chunk before's last latent frames
+        context_offsets: Optional[tuple] = None,  # their times, before this chunk's frame 0
+        ctrl_time: Optional[float] = None,  # HERESY 1879b: the picture's time beside context latents (None: frame 0)
+        decode: bool = True,  # HERESY 1879: False gives the latents back, the whole shot decoded once
+        last_img: Optional[Image.Image] = None,  # HERESY 2361: a last-frame keyframe (FL2VA's «last»), already canvas-sized
         **kwargs,
     ):
         model = self.model
@@ -113,6 +118,14 @@ class MiniMaxH3Pipeline:
         if ctrl_img is not None and ref_images:
             raise ValueError("ctrl_img (first frame) and ref_images are exclusive")
         anchors = ("first",) if ctrl_img is not None else ()
+        if context_latents is not None:  # HERESY 1879: the picture (the chunk before's last frame) at frame 0 or at its time, the latents at theirs
+            if ref_images:
+                raise ValueError("context latents go without references")
+            anchors = (("first" if ctrl_time is None else float(ctrl_time),) if ctrl_img is not None else ()) + tuple(float(x) for x in context_offsets)
+        if last_img is not None:  # HERESY 2361: the last frame pinned at the target's last latent frame, its rows after all the others
+            if ref_images:
+                raise ValueError("a last frame goes without references")
+            anchors = anchors + ("last",)
         # references keep their own aspect: latent dims come from each image
         # (PIL images are single-frame blocks; video refs arrive as latent
         # tensors (C, T, h, w) already encoded by the caller)
@@ -169,7 +182,11 @@ class MiniMaxH3Pipeline:
 
         cond_rows = None
         cond_audio_rows = None
-        if ctrl_img is not None:
+        if context_latents is not None:  # HERESY 1879: the picture first, then the latents noise-augmented as a keyframe is, as the anchors go
+            cond_rows = encode_condition_image(ctrl_img) if ctrl_img is not None else None
+            ctx_rows = noise_aug_rows(context_latents)
+            cond_rows = ctx_rows if cond_rows is None else torch.cat([cond_rows, ctx_rows], dim=1)
+        elif ctrl_img is not None:
             cond_rows = encode_condition_image(ctrl_img)
         elif ref_images:
             parts = []
@@ -187,6 +204,10 @@ class MiniMaxH3Pipeline:
             cond_rows = torch.cat(parts, dim=1)
             if audio_parts:
                 cond_audio_rows = torch.cat(audio_parts, dim=1).float()
+
+        if last_img is not None:  # HERESY 2361: its condition noise drawn after the first frame's (a shot without one draws as before)
+            last_rows = encode_condition_image(last_img)
+            cond_rows = last_rows if cond_rows is None else torch.cat([cond_rows, last_rows], dim=1)
 
         # --- initial noise -------------------------------------------------
         if latents is None:
@@ -265,6 +286,8 @@ class MiniMaxH3Pipeline:
 
         # --- decode --------------------------------------------------------
         video_latents = unpatchify_video_tokens(video_rows, t_lat, h_lat, w_lat)
+        if not decode:  # HERESY 1879
+            return {"latents": video_latents}
         video = model.decode_latents(video_latents)  # (1, 3, T, H, W) in [-1, 1]
         video = ((video.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
         video = video[0].permute(1, 2, 3, 0).cpu()  # (T, H, W, C)
