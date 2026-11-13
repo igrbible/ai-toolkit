@@ -1,4 +1,10 @@
-"""YuE2 Oobleck-style waveform VAE (48 kHz stereo, 64-ch latents at 25 Hz).
+"""Ruach Studio's own trainer (HERESY 1086): the YuE2 waveform VAE, for the latent cache.
+
+Ported from Ostris' AI-Toolkit (MIT, Copyright (c) 2024 Ostris, LLC; LICENSE-AITK beside this file):
+extensions_built_in/audio_models/yue2/src/vae.py, unchanged but for its mixin. Its weights are the
+``vae.*`` tensors of the Comfy-Org checkpoint; it runs in float32, as the reference does.
+
+YuE2 Oobleck-style waveform VAE (48 kHz stereo, 64-ch latents at 25 Hz).
 
 Matches the ``vae.*`` tensors of the Comfy-Org repack: channels 64, channel
 multipliers (1, 2, 4, 8, 16, 32), strides (2, 2, 4, 4, 5, 6) -> hop 1920.
@@ -12,7 +18,6 @@ import math
 import torch
 from torch import nn
 
-from toolkit.models.v2._mixin import OstrisModelMixin
 
 SAMPLE_RATE = 48000
 HOP = 1920
@@ -104,7 +109,7 @@ def convert_weight_norm_keys(sd: dict) -> dict:
     return out
 
 
-class YuE2VAE(nn.Module, OstrisModelMixin):
+class YuE2VAE(nn.Module):
     @classmethod
     def load_from_state_dict(cls, state_dict, dtype=torch.float32):
         vae = cls()

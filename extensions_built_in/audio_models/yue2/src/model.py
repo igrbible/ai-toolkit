@@ -1,4 +1,10 @@
-"""YuE2 AR + NAR mixture-of-transformers backbone in the ComfyUI repack layout.
+"""Ruach Studio's own trainer (HERESY 1083, stage 1 of heresy/docs/TRAINER-PLAN.md): the YuE2 network.
+
+Ported from Ostris' AI-Toolkit (MIT, Copyright (c) 2024 Ostris, LLC; see LICENSE-AITK beside this file):
+extensions_built_in/audio_models/yue2/src/model.py, the network as it is. Changed: no AI-Toolkit mixin
+and no quantized layers here (lab/trainer/load.py hands this module plain bf16 weights).
+
+YuE2 AR + NAR mixture-of-transformers backbone in the ComfyUI repack layout.
 
 Two 28-layer Qwen3-shaped experts share one architecture:
   - ``YuE2AR``  (``text_encoders.*`` in the repack): token embedding, causal
@@ -20,7 +26,6 @@ import torch.nn.functional as F
 from torch import nn
 import torch.utils.checkpoint as ckpt
 
-from toolkit.models.v2._mixin import OstrisModelMixin
 
 # vocabulary layout of the AR expert
 EOD = 151643
@@ -318,10 +323,8 @@ class YuE2NAR(YuE2Expert):
         return self.llm2vae(self.model.norm(x))[:, 1:-1]
 
 
-class YuE2Model(nn.Module, OstrisModelMixin):
+class YuE2Model(nn.Module):
     """Both experts under one module so a single LoRA network covers them."""
-
-    aitk_comfy_repo = "Comfy-Org/YuE2"
 
     def __init__(self, cfg: Optional[YuE2Config] = None):
         super().__init__()
@@ -353,120 +356,3 @@ class YuE2Model(nn.Module, OstrisModelMixin):
     def disable_gradient_checkpointing(self):
         self.ar.gradient_checkpointing = False
         self.nar.gradient_checkpointing = False
-
-    @classmethod
-    def load_from_state_dict(cls, sd: dict, dtype=torch.bfloat16):
-        """``sd`` is a Comfy-Org all-in-one checkpoint (raw keys): bf16, or the int8 convrot repack whose
-        ``comfy_quant`` markers attach the shipped quantization directly (no requantization)."""
-        from toolkit.util.comfy_quant_import import Int8Embedding, import_comfy_quantized_layers
-        from toolkit.util.ostris_quant import OstrisLinear
-
-        model = cls()
-        nar_sd = {k[len("model.diffusion_model.") :]: v for k, v in sd.items() if k.startswith("model.diffusion_model.")}
-        ar_sd = {k[len("text_encoders.") :]: v for k, v in sd.items() if k.startswith("text_encoders.") and k != "text_encoders.yue2_tokenizer_json"}
-        prequantized = any(k.endswith(".comfy_quant") for k in sd)
-        for name, module, part in (("NAR", model.nar, nar_sd), ("AR", model.ar, ar_sd)):
-            allowed_missing = set()
-            if prequantized:
-                quantized_paths = {k[: -len(".comfy_quant")] for k in part if k.endswith(".comfy_quant")}
-                part, n = import_comfy_quantized_layers(module, part, orig_dtype=dtype)
-                for mod_name, m in module.named_modules():
-                    if isinstance(m, OstrisLinear):
-                        allowed_missing.add(f"{mod_name}.weight")
-                        if m.bias is not None:
-                            allowed_missing.add(f"{mod_name}.bias")
-                            m.bias.data = m.bias.data.to(dtype)
-                    elif isinstance(m, (Int8Embedding, nn.Embedding)) and mod_name in quantized_paths:
-                        allowed_missing.add(f"{mod_name}.weight")
-            part = {k: (v.to(dtype) if v.is_floating_point() else v) for k, v in part.items()}
-            missing, unexpected = module.load_state_dict(part, strict=False)
-            missing = [k for k in missing if k not in allowed_missing]
-            if missing:
-                raise ValueError(f"YuE2 {name} missing keys: {missing[:5]} (+{max(0, len(missing) - 5)})")
-            if unexpected:
-                print(f"    YuE2 {name} unexpected: {len(unexpected)} (first 3: {unexpected[:3]})")
-        if not prequantized:
-            return model.to(dtype)
-        # cast the remaining float tensors (norms, embeddings, buffers) without touching the quantized layers
-        for m in model.modules():
-            if isinstance(m, (OstrisLinear, Int8Embedding)):
-                continue
-            for pname, prm in list(m.named_parameters(recurse=False)):
-                if prm.is_floating_point():
-                    prm.data = prm.data.to(dtype)
-            for bname, buf in list(m.named_buffers(recurse=False)):
-                if buf is not None and buf.is_floating_point():
-                    setattr(m, bname, buf.to(dtype))
-        model.aitk_is_quantized = True  # aitk_post_load keeps the shipped convrot8 layers when convrot8 is requested
-        return model
-
-
-@torch.no_grad()
-def _nar_lora_from_safetensors(path: str) -> dict:
-    """The ``.safetensors`` releases of the community NAR adapter name every tensor
-    (``layers.N.nar_self_attn.q_proj.lora_A`` ..., ``vae2llm.*``, ``llm2vae.*``); rebuild the
-    ``.pt`` layout (``lora``: layer-major A/B list, ``io``: full projection weights) that the merge walks.
-    The ``_comfyui`` files use ComfyUI's fused layout and are not handled here."""
-    from safetensors.torch import load_file
-
-    tensors = load_file(path, device="cpu")
-    if not any(".nar_self_attn." in k and k.endswith(".lora_A") for k in tensors):
-        raise ValueError(f"{path}: not an unmerged NAR LoRA release (the _comfyui layout is not supported for merging)")
-    modules = [("nar_self_attn", n) for n in ("q_proj", "k_proj", "v_proj", "o_proj")]
-    modules += [("nar_mlp", n) for n in ("gate_proj", "up_proj", "down_proj")]
-    lora = []
-    for layer in sorted({int(k.split(".")[1]) for k in tensors if k.startswith("layers.")}):
-        for block, proj in modules:
-            lora += [tensors[f"layers.{layer}.{block}.{proj}.lora_A"], tensors[f"layers.{layer}.{block}.{proj}.lora_B"]]
-    io = {m: {k.split(".", 1)[1]: v for k, v in tensors.items() if k.startswith(m + ".")} for m in ("vae2llm", "llm2vae")}
-    return {"lora": lora, "io": {m: sd for m, sd in io.items() if sd}}
-
-
-def merge_nar_lora(model: YuE2Model, ckpt_path: str, scale: float = 1.0):
-    """Fold the community NAR adapter (unmerged q/k/v + gate/up LoRA pairs,
-    plus full vae2llm/llm2vae weights) into the merged-projection base."""
-    if str(ckpt_path).endswith(".safetensors"):
-        ck = _nar_lora_from_safetensors(ckpt_path)
-    else:
-        try:
-            ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        except Exception:
-            ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if getattr(model, "aitk_is_quantized", False):
-        raise ValueError("merge_nar_lora needs the bf16 checkpoint; the int8 convrot repack cannot take merged weights")
-    tensors = iter(ck["lora"])
-    cfg = model.cfg
-    inner = cfg.num_attention_heads * cfg.head_dim
-    kv = cfg.num_key_value_heads * cfg.head_dim
-    qkv_rows = {"q_proj": (0, inner), "k_proj": (inner, inner + kv), "v_proj": (inner + kv, inner + 2 * kv)}
-    gu_rows = {"gate_proj": (0, cfg.intermediate_size), "up_proj": (cfg.intermediate_size, 2 * cfg.intermediate_size)}
-    for layer in model.nar.model.layers:
-        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            A = next(tensors).float()
-            B = next(tensors).float()
-            delta = (B @ A) * scale
-            if name == "o_proj":
-                w = layer.self_attn.o_proj.weight
-                w.add_(delta.to(w.device, w.dtype))
-            else:
-                r0, r1 = qkv_rows[name]
-                w = layer.self_attn.qkv_proj.weight
-                w[r0:r1].add_(delta.to(w.device, w.dtype))
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            A = next(tensors).float()
-            B = next(tensors).float()
-            delta = (B @ A) * scale
-            if name == "down_proj":
-                w = layer.mlp.down_proj.weight
-                w.add_(delta.to(w.device, w.dtype))
-            else:
-                r0, r1 = gu_rows[name]
-                w = layer.mlp.gate_up_proj.weight
-                w[r0:r1].add_(delta.to(w.device, w.dtype))
-    io = ck.get("io", {})
-    for name in ("vae2llm", "llm2vae"):
-        if name in io:
-            mod = getattr(model.nar, name)
-            for pname, value in io[name].items():
-                getattr(mod, pname).copy_(value.to(mod.weight.device, mod.weight.dtype))
-    return model
