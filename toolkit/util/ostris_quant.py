@@ -188,23 +188,14 @@ def get_ostris_quantizer(qtype: str) -> Optional[OstrisQuantizer]:
     from toolkit.util.convrot_quant import CONVROT_QTYPES, get_convrot_quantizer
     from toolkit.util.float8_quant import FLOAT8_QTYPES, Float8Quantizer
     from toolkit.util.nvfp4_quant import NVFP4_QTYPES, Nvfp4Quantizer
-    from toolkit.util.orbit_quant import ORBIT_QTYPES, OrbitQuantizer
-    from toolkit.util.orbit_vq_quant import ORBIT_VQ_QTYPES, OrbitVQQuantizer
-    from toolkit.util.uintx_quant import UINTX_QTYPES, UIntXQuantizer
 
     quantizer = None
-    if qtype in ORBIT_QTYPES:
-        quantizer = OrbitQuantizer(ORBIT_QTYPES[qtype])
-    elif qtype in ORBIT_VQ_QTYPES:
-        quantizer = OrbitVQQuantizer(**ORBIT_VQ_QTYPES[qtype])
-    elif qtype in CONVROT_QTYPES:
+    if qtype in CONVROT_QTYPES:
         quantizer = get_convrot_quantizer(qtype)
     elif qtype in NVFP4_QTYPES:
         quantizer = Nvfp4Quantizer()
     elif qtype in FLOAT8_QTYPES:
         quantizer = Float8Quantizer()
-    elif qtype in UINTX_QTYPES:
-        quantizer = UIntXQuantizer(UINTX_QTYPES[qtype])
     if quantizer is not None:
         # quantized saves read this back to restore the backend on load
         quantizer.qtype = qtype
